@@ -27,6 +27,7 @@ import (
 	actionsv1alpha1 "github.com/summerwind/actions-runner-controller/api/v1alpha1"
 	"github.com/summerwind/actions-runner-controller/controllers"
 	"github.com/summerwind/actions-runner-controller/github"
+	zaplib "go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
@@ -38,6 +39,11 @@ import (
 const (
 	defaultRunnerImage = "summerwind/actions-runner:latest"
 	defaultDockerImage = "docker:dind"
+
+	logLevelDebug = "debug"
+	logLevelInfo  = "info"
+	logLevelWarn  = "warn"
+	logLevelError = "error"
 )
 
 var (
@@ -61,9 +67,12 @@ func main() {
 		enableLeaderElection bool
 		syncPeriod           time.Duration
 
+		gitHubAPICacheDuration time.Duration
+
 		runnerImage string
 		dockerImage string
 		namespace   string
+		logLevel    string
 
 		commonRunnerLabels commaSeparatedStringSlice
 	)
@@ -83,13 +92,27 @@ func main() {
 	flag.Int64Var(&c.AppID, "github-app-id", c.AppID, "The application ID of GitHub App.")
 	flag.Int64Var(&c.AppInstallationID, "github-app-installation-id", c.AppInstallationID, "The installation ID of GitHub App.")
 	flag.StringVar(&c.AppPrivateKey, "github-app-private-key", c.AppPrivateKey, "The path of a private key file to authenticate as a GitHub App")
-	flag.DurationVar(&syncPeriod, "sync-period", 10*time.Minute, "Determines the minimum frequency at which K8s resources managed by this controller are reconciled. When you use autoscaling, set to a lower value like 10 minute, because this corresponds to the minimum time to react on demand change")
+	flag.DurationVar(&gitHubAPICacheDuration, "github-api-cache-duration", 0, "The duration until the GitHub API cache expires. Setting this to e.g. 10m results in the controller tries its best not to make the same API call within 10m to reduce the chance of being rate-limited. Defaults to mostly the same value as sync-period. If you're tweaking this in order to make autoscaling more responsive, you'll probably want to tweak sync-period, too")
+	flag.DurationVar(&syncPeriod, "sync-period", 10*time.Minute, "Determines the minimum frequency at which K8s resources managed by this controller are reconciled. When you use autoscaling, set to a lower value like 10 minute, because this corresponds to the minimum time to react on demand change. . If you're tweaking this in order to make autoscaling more responsive, you'll probably want to tweak github-api-cache-duration, too")
 	flag.Var(&commonRunnerLabels, "common-runner-labels", "Runner labels in the K1=V1,K2=V2,... format that are inherited all the runners created by the controller. See https://github.com/summerwind/actions-runner-controller/issues/321 for more information")
 	flag.StringVar(&namespace, "watch-namespace", "", "The namespace to watch for custom resources. Set to empty for letting it watch for all namespaces.")
+	flag.StringVar(&logLevel, "log-level", logLevelDebug, `The verbosity of the logging. Valid values are "debug", "info", "warn", "error". Defaults to "debug".`)
 	flag.Parse()
 
 	logger := zap.New(func(o *zap.Options) {
-		o.Development = true
+		switch logLevel {
+		case logLevelDebug:
+			o.Development = true
+		case logLevelInfo:
+			lvl := zaplib.NewAtomicLevelAt(zaplib.InfoLevel)
+			o.Level = &lvl
+		case logLevelWarn:
+			lvl := zaplib.NewAtomicLevelAt(zaplib.WarnLevel)
+			o.Level = &lvl
+		case logLevelError:
+			lvl := zaplib.NewAtomicLevelAt(zaplib.ErrorLevel)
+			o.Level = &lvl
+		}
 	})
 
 	ghClient, err = c.NewClient()
@@ -151,12 +174,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	if gitHubAPICacheDuration == 0 {
+		gitHubAPICacheDuration = syncPeriod - 10*time.Second
+	}
+
+	if gitHubAPICacheDuration < 0 {
+		gitHubAPICacheDuration = 0
+	}
+
+	log.Info(
+		"Initializing actions-runner-controller",
+		"github-api-cahce-duration", gitHubAPICacheDuration,
+		"sync-period", syncPeriod,
+		"runner-image", runnerImage,
+		"docker-image", dockerImage,
+		"common-runnner-labels", commonRunnerLabels,
+		"watch-namespace", namespace,
+	)
+
 	horizontalRunnerAutoscaler := &controllers.HorizontalRunnerAutoscalerReconciler{
 		Client:        mgr.GetClient(),
 		Log:           log.WithName("horizontalrunnerautoscaler"),
 		Scheme:        mgr.GetScheme(),
 		GitHubClient:  ghClient,
-		CacheDuration: syncPeriod - 10*time.Second,
+		CacheDuration: gitHubAPICacheDuration,
 	}
 
 	if err = horizontalRunnerAutoscaler.SetupWithManager(mgr); err != nil {
